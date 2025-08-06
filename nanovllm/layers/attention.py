@@ -58,8 +58,6 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         use_cuda_path = _IS_CUDA_AVAILABLE and q.device.type == 'cuda'
-
-        # This is the main check. If the cache is empty, it's the warmup run.
         is_warmup = self.k_cache.numel() == 0
 
         # --- CUDA Path (Optimized) ---
@@ -70,7 +68,11 @@ class Attention(nn.Module):
             
             q = q.view(-1, self.num_heads, self.head_dim)
             if context.is_prefill:
-                o = flash_attn_varlen_func(q, k_cache, v_cache,
+                # For initial prefill, block_tables is None, so we use the passed k,v.
+                # For prefill with cache, block_tables exists, and flash_attn uses the cache.
+                k_to_use = k_cache if context.block_tables is not None else k.view(-1, self.num_kv_heads, self.head_dim)
+                v_to_use = v_cache if context.block_tables is not None else v.view(-1, self.num_kv_heads, self.head_dim)
+                o = flash_attn_varlen_func(q, k_to_use, v_to_use,
                                            cu_seqlens_q=context.cu_seqlens_q,
                                            cu_seqlens_k=context.cu_seqlens_k,
                                            max_seqlen_q=context.max_seqlen_q,
@@ -84,11 +86,11 @@ class Attention(nn.Module):
         else:
             q = q.view(-1, self.num_heads, self.head_dim)
             
-            # Scenario 1: Warmup run (cache is empty). Perform standard attention.
-            if is_warmup:
+            # Scenario 1: Warmup run OR Initial Prefill (no block tables).
+            # Perform standard batched causal attention.
+            if is_warmup or context.block_tables is None:
                 k = k.view(-1, self.num_kv_heads, self.head_dim)
                 v = v.view(-1, self.num_kv_heads, self.head_dim)
-                # This logic handles batched attention for the warmup sequences
                 outputs = []
                 for i in range(len(context.cu_seqlens_q) - 1):
                     q_seq = q[context.cu_seqlens_q[i]:context.cu_seqlens_q[i+1]]
@@ -103,7 +105,7 @@ class Attention(nn.Module):
                     outputs.append(o_seq.squeeze(0))
                 o = torch.cat(outputs, dim=0) if outputs else torch.empty_like(q)
 
-            # Scenario 2: Normal run (cache exists). Perform paged attention.
+            # Scenario 2: Normal run (decode or prefill with cache). Perform paged attention.
             else:
                 k_cache, v_cache = self.k_cache, self.v_cache
                 if context.slot_mapping is not None and context.slot_mapping.numel() > 0:
@@ -121,11 +123,11 @@ class Attention(nn.Module):
                     if context.is_prefill:
                         q_seq = q[context.cu_seqlens_q[i]:context.cu_seqlens_q[i+1]]
                         k_len = (context.cu_seqlens_k[i+1] - context.cu_seqlens_k[i]).item()
-                        block_table = context.block_tables[i]
                     else: # decode
                         q_seq = q[i:i+1]
                         k_len = context.context_lens[i].item()
-                        block_table = context.block_tables[i]
+                    
+                    block_table = context.block_tables[i]
 
                     if k_len == 0:
                         outputs.append(torch.zeros_like(q_seq))

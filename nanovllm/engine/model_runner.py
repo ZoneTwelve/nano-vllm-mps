@@ -12,6 +12,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+from nanovllm.utils.logging import logger
 
 
 class ModelRunner:
@@ -129,7 +130,6 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         
-        # For CUDA, we calculate the number of blocks dynamically.
         if self.is_cuda and config.num_kvcache_blocks == -1:
             free, total = torch.cuda.mem_get_info()
             used = total - free
@@ -137,20 +137,22 @@ class ModelRunner:
             current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
             available_mem = total * config.gpu_memory_utilization - used - peak + current
             
+            logger.info(f"CUDA memory info: Total={total/1e9:.2f}GB, Free={free/1e9:.2f}GB.")
+            logger.info(f"Calculated available memory for cache: {available_mem/1e9:.2f}GB.")
+            
             num_kv_heads = hf_config.num_key_value_heads // self.world_size
             block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
             
             config.num_kvcache_blocks = int(available_mem) // block_bytes
+            logger.info(f"Dynamically allocating {config.num_kvcache_blocks} KV cache blocks for CUDA.")
         
-        # For MPS, a default value is set in the Config.
-        # This assertion will now catch if the default is too large for the system,
-        # or if the user provides an invalid number.
         assert config.num_kvcache_blocks > 0, (
             f"Insufficient GPU memory to allocate KV cache. "
             f"The number of KV cache blocks is configured to {config.num_kvcache_blocks}, which is not possible. "
             "If you are on an MPS device, the default may be too high for your system. "
             "Try explicitly setting a smaller `num_kvcache_blocks` when creating the LLM object."
         )
+        logger.info(f"Allocating {config.num_kvcache_blocks} KV cache blocks.")
 
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
