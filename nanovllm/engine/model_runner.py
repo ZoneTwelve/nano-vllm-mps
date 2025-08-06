@@ -129,38 +129,30 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         
-        if self.is_cuda:
+        # For CUDA, we calculate the number of blocks dynamically.
+        if self.is_cuda and config.num_kvcache_blocks == -1:
             free, total = torch.cuda.mem_get_info()
             used = total - free
             peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
             current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
             available_mem = total * config.gpu_memory_utilization - used - peak + current
-        else: # MPS
-            # CORRECTED LOGIC FOR MPS:
-            # Use current_allocated_memory after model loading as a proxy for model footprint.
-            model_mem = torch.mps.current_allocated_memory()
-            pool_size = torch.mps.driver_allocated_memory()
-            available_mem = pool_size * config.gpu_memory_utilization - model_mem
-            print("model_mem", model_mem)
-            print("pool_size", pool_size)
-
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        
-        if available_mem > 0:
+            
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+            block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
+            
             config.num_kvcache_blocks = int(available_mem) // block_bytes
-        else:
-            config.num_kvcache_blocks = 0
-
+        
+        # For MPS, a default value is set in the Config.
+        # This assertion will now catch if the default is too large for the system,
+        # or if the user provides an invalid number.
         assert config.num_kvcache_blocks > 0, (
             f"Insufficient GPU memory to allocate KV cache. "
-            f"Calculated available memory for cache: {available_mem / 1e9:.2f} GB. "
-            f"Estimated KV block size: {block_bytes / 1e6:.2f} MB. "
-            f"This resulted in {config.num_kvcache_blocks} blocks. "
-            "Try lowering the `gpu_memory_utilization` parameter (e.g., to 0.8) "
-            "or use a smaller model."
+            f"The number of KV cache blocks is configured to {config.num_kvcache_blocks}, which is not possible. "
+            "If you are on an MPS device, the default may be too high for your system. "
+            "Try explicitly setting a smaller `num_kvcache_blocks` when creating the LLM object."
         )
 
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
         for module in self.model.modules():

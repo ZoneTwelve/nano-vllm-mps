@@ -26,7 +26,6 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
 
-        # MPS backend support: Auto-detect device
         if self.device == "auto":
             if torch.cuda.is_available():
                 self.device = "cuda"
@@ -35,11 +34,15 @@ class Config:
             else:
                 self.device = "cpu"
         
-        # MPS backend support: Force single-process and eager mode
         if self.device == "mps":
             print("MPS backend detected. Forcing tensor_parallel_size=1 and enforce_eager=True.")
             self.tensor_parallel_size = 1
-            self.enforce_eager = True  # CUDA graphs are not supported on MPS
+            self.enforce_eager = True
+            # If num_kvcache_blocks is not user-set, provide a safe default for MPS.
+            # The automatic calculation is unreliable on MPS.
+            if self.num_kvcache_blocks == -1:
+                print("Setting a default of 1024 KV cache blocks for MPS. You can override this with the `num_kvcache_blocks` parameter.")
+                self.num_kvcache_blocks = 1024
 
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
