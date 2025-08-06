@@ -3,6 +3,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from nanovllm.utils.context import get_context
+from nanovllm.utils.logging import logger
 from typing import Optional
 
 # Conditionally import CUDA-specific libraries
@@ -68,8 +69,6 @@ class Attention(nn.Module):
             
             q = q.view(-1, self.num_heads, self.head_dim)
             if context.is_prefill:
-                # For initial prefill, block_tables is None, so we use the passed k,v.
-                # For prefill with cache, block_tables exists, and flash_attn uses the cache.
                 k_to_use = k_cache if context.block_tables is not None else k.view(-1, self.num_kv_heads, self.head_dim)
                 v_to_use = v_cache if context.block_tables is not None else v.view(-1, self.num_kv_heads, self.head_dim)
                 o = flash_attn_varlen_func(q, k_to_use, v_to_use,
@@ -84,42 +83,23 @@ class Attention(nn.Module):
                                             softmax_scale=self.scale, causal=True)
         # --- MPS / CPU / CUDA-Warmup Path (Fallback) ---
         else:
+            logger.debug(f"Entering MPS/CPU fallback. is_warmup={is_warmup}, is_prefill={context.is_prefill}")
             q = q.view(-1, self.num_heads, self.head_dim)
             
-            # Scenario 1: Warmup run OR Initial Prefill (no block tables).
-            # Perform standard batched causal attention.
-            if is_warmup or context.block_tables is None:
-                k = k.view(-1, self.num_kv_heads, self.head_dim)
-                v = v.view(-1, self.num_kv_heads, self.head_dim)
-                outputs = []
-                for i in range(len(context.cu_seqlens_q) - 1):
-                    q_seq = q[context.cu_seqlens_q[i]:context.cu_seqlens_q[i+1]]
-                    k_seq = k[context.cu_seqlens_k[i]:context.cu_seqlens_k[i+1]]
-                    v_seq = v[context.cu_seqlens_k[i]:context.cu_seqlens_k[i+1]]
+            # This path handles all non-flash-attn cases by manually implementing attention.
+            # This is to bypass suspected bugs in the MPS implementation of F.scaled_dot_product_attention.
+            outputs = []
+            num_seqs = len(context.cu_seqlens_q) - 1 if context.is_prefill else q.shape[0]
 
-                    if self.num_heads != self.num_kv_heads:
-                        k_seq = k_seq.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-                        v_seq = v_seq.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-                    
-                    o_seq = F.scaled_dot_product_attention(q_seq.unsqueeze(0), k_seq.unsqueeze(0), v_seq.unsqueeze(0), scale=self.scale, is_causal=True)
-                    outputs.append(o_seq.squeeze(0))
-                o = torch.cat(outputs, dim=0) if outputs else torch.empty_like(q)
-
-            # Scenario 2: Normal run (decode or prefill with cache). Perform paged attention.
-            else:
-                k_cache, v_cache = self.k_cache, self.v_cache
-                if context.slot_mapping is not None and context.slot_mapping.numel() > 0:
-                    store_kvcache_pytorch(k.view(-1, self.num_kv_heads, self.head_dim), v.view(-1, self.num_kv_heads, self.head_dim), k_cache, v_cache, context.slot_mapping)
-
-                outputs = []
-                num_seqs = len(context.cu_seqlens_q) - 1 if context.is_prefill else q.shape[0]
-                block_size = context.block_size
-                assert block_size > 0, "Block size must be set in context for paged attention."
-
-                k_cache_flat = k_cache.view(-1, self.num_kv_heads, self.head_dim)
-                v_cache_flat = v_cache.view(-1, self.num_kv_heads, self.head_dim)
-
-                for i in range(num_seqs):
+            for i in range(num_seqs):
+                # 1. Get the Q, K, V for the current sequence
+                if is_warmup or (context.is_prefill and context.block_tables is None):
+                    q_start, q_end = context.cu_seqlens_q[i], context.cu_seqlens_q[i+1]
+                    k_start, k_end = context.cu_seqlens_k[i], context.cu_seqlens_k[i+1]
+                    q_seq = q[q_start:q_end]
+                    k_seq = k.view(-1, self.num_kv_heads, self.head_dim)[k_start:k_end]
+                    v_seq = v.view(-1, self.num_kv_heads, self.head_dim)[k_start:k_end]
+                else: # Paged attention
                     if context.is_prefill:
                         q_seq = q[context.cu_seqlens_q[i]:context.cu_seqlens_q[i+1]]
                         k_len = (context.cu_seqlens_k[i+1] - context.cu_seqlens_k[i]).item()
@@ -128,37 +108,50 @@ class Attention(nn.Module):
                         k_len = context.context_lens[i].item()
                     
                     block_table = context.block_tables[i]
-
-                    if k_len == 0:
-                        outputs.append(torch.zeros_like(q_seq))
-                        continue
-
+                    k_cache_flat = self.k_cache.view(-1, self.num_kv_heads, self.head_dim)
+                    v_cache_flat = self.v_cache.view(-1, self.num_kv_heads, self.head_dim)
+                    
                     k_seq = torch.empty(k_len, self.num_kv_heads, self.head_dim, dtype=q.dtype, device=q.device)
                     v_seq = torch.empty(k_len, self.num_kv_heads, self.head_dim, dtype=q.dtype, device=q.device)
-
+                    
                     for token_idx in range(k_len):
-                        block_idx = block_table[token_idx // block_size].item()
-                        block_offset = token_idx % block_size
-                        slot_idx = block_idx * block_size + block_offset
+                        block_idx = block_table[token_idx // context.block_size].item()
+                        block_offset = token_idx % context.block_size
+                        slot_idx = block_idx * context.block_size + block_offset
                         k_seq[token_idx] = k_cache_flat[slot_idx]
                         v_seq[token_idx] = v_cache_flat[slot_idx]
 
-                    if self.num_heads != self.num_kv_heads:
-                        k_seq = k_seq.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-                        v_seq = v_seq.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+                # 2. Handle GQA by repeating K and V heads
+                if self.num_heads != self.num_kv_heads:
+                    k_seq = k_seq.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
+                    v_seq = v_seq.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
 
-                    attn_mask: Optional[torch.Tensor] = None
-                    q_len, is_causal = q_seq.shape[0], True
-                    if context.is_prefill and q_len != k_len:
-                        is_causal = False
-                        prefix_len = k_len - q_len
-                        attn_mask = torch.ones(q_len, k_len, dtype=torch.bool, device=q.device)
-                        attn_mask[:, :prefix_len] = False
-                        attn_mask[:, prefix_len:] = torch.triu(attn_mask[:, prefix_len:], diagonal=1)
-                    
-                    o_seq = F.scaled_dot_product_attention(q_seq.unsqueeze(0), k_seq.unsqueeze(0), v_seq.unsqueeze(0), attn_mask=attn_mask, scale=self.scale, is_causal=is_causal)
-                    outputs.append(o_seq.squeeze(0))
+                # 3. Manually compute scaled dot-product attention
+                q_len, k_len = q_seq.shape[0], k_seq.shape[0]
+                q_seq = q_seq.transpose(0, 1) # [num_heads, q_len, head_dim]
+                k_seq = k_seq.transpose(0, 1) # [num_heads, k_len, head_dim]
+                v_seq = v_seq.transpose(0, 1) # [num_heads, k_len, head_dim]
+
+                logger.debug(f"Seq {i} shapes for matmul: q_seq={q_seq.shape}, k_seq={k_seq.shape}")
+                attn_weights = torch.matmul(q_seq, k_seq.transpose(-1, -2)) * self.scale
                 
-                o = torch.cat(outputs, dim=0) if outputs else torch.empty_like(q)
+                # Apply causal mask
+                if q_len == k_len:
+                    mask = torch.triu(torch.ones(q_len, k_len, dtype=torch.bool, device=q.device), diagonal=1)
+                    attn_weights.masked_fill_(mask, -torch.inf)
+                elif q_len < k_len: # Prefill with prefix
+                    prefix_len = k_len - q_len
+                    mask = torch.ones(q_len, k_len, dtype=torch.bool, device=q.device)
+                    mask[:, :prefix_len] = False
+                    mask[:, prefix_len:] = torch.triu(mask[:, prefix_len:], diagonal=1)
+                    attn_weights.masked_fill_(mask, -torch.inf)
+
+                attn_weights = F.softmax(attn_weights, dim=-1)
+                o_seq = torch.matmul(attn_weights, v_seq)
+                o_seq = o_seq.transpose(0, 1).contiguous()
+                
+                outputs.append(o_seq)
+            
+            o = torch.cat(outputs, dim=0) if outputs else torch.empty_like(q)
 
         return o.view(-1, self.num_heads * self.head_dim)

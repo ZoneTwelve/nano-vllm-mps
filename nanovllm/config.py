@@ -44,7 +44,7 @@ class Config:
             self.tensor_parallel_size = 1
             self.enforce_eager = True
             if self.num_kvcache_blocks == -1:
-                self.num_kvcache_blocks = 128
+                self.num_kvcache_blocks = 256
                 logger.info(f"Setting default num_kvcache_blocks={self.num_kvcache_blocks} for MPS.")
 
         self.hf_config = AutoConfig.from_pretrained(self.model)

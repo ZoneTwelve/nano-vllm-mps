@@ -10,7 +10,7 @@ def main():
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
-        "introduce yourself",
+        "what's 1+1?",
         "list all prime numbers within 100",
     ]
     prompts = [
