@@ -1,4 +1,6 @@
+# FILE: nanovllm/engine/scheduler.py
 from collections import deque
+from typing import Deque, List, Tuple
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
@@ -12,8 +14,8 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
-        self.waiting: deque[Sequence] = deque()
-        self.running: deque[Sequence] = deque()
+        self.waiting: Deque[Sequence] = deque()
+        self.running: Deque[Sequence] = deque()
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -21,7 +23,7 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule(self) -> Tuple[List[Sequence], bool]:
         # prefill
         scheduled_seqs = []
         num_seqs = 0
@@ -62,7 +64,7 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
+    def postprocess(self, seqs: List[Sequence], token_ids: List[int]):
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:

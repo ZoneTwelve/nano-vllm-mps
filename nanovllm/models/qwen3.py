@@ -1,7 +1,9 @@
+# FILE: nanovllm/models/qwen3.py
 import torch
 from torch import nn
 import torch.distributed as dist
 from transformers import Qwen3Config
+from typing import Optional, Tuple
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
@@ -19,14 +21,18 @@ class Qwen3Attention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         max_position: int = 4096 * 32,
-        head_dim: int | None = None,
+        head_dim: Optional[int] = None,
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
         rope_theta: float = 10000,
-        rope_scaling: tuple | None = None,
+        rope_scaling: Optional[tuple] = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        if dist.is_initialized():
+            tp_size = dist.get_world_size()
+        else:
+            tp_size = 1
+            
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -144,8 +150,8 @@ class Qwen3DecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)

@@ -1,5 +1,7 @@
+# FILE: nanovllm/layers/layernorm.py
 import torch
 from torch import nn
+from typing import Optional, Tuple, Union
 
 
 class RMSNorm(nn.Module):
@@ -43,8 +45,8 @@ class RMSNorm(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if residual is None:
             return self.rms_forward(x)
         else:

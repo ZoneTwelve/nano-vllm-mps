@@ -1,7 +1,9 @@
+# FILE: nanovllm/layers/linear.py
 import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
+from typing import Optional, List
 
 
 def divide(numerator, denominator):
@@ -15,14 +17,18 @@ class LinearBase(nn.Module):
         self,
         input_size: int,
         output_size: int,
-        tp_dim: int | None = None,
+        tp_dim: Optional[int] = None,
     ):
         super().__init__()
         self.input_size = input_size
         self.output_size = output_size
         self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        if dist.is_initialized():
+            self.tp_rank = dist.get_rank()
+            self.tp_size = dist.get_world_size()
+        else:
+            self.tp_rank = 0
+            self.tp_size = 1
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -88,7 +94,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
     def __init__(
         self,
         input_size: int,
-        output_sizes: list[int],
+        output_sizes: List[int],
         bias: bool = False,
     ):
         self.output_sizes = output_sizes
@@ -110,13 +116,19 @@ class QKVParallelLinear(ColumnParallelLinear):
         hidden_size: int,
         head_size: int,
         total_num_heads: int,
-        total_num_kv_heads: int | None = None,
+        total_num_kv_heads: Optional[int] = None,
         bias: bool = False,
     ):
         self.head_size = head_size
         self.total_num_heads = total_num_heads
         self.total_num_kv_heads = total_num_kv_heads or total_num_heads
-        tp_size = dist.get_world_size()
+        
+        # This layer's __init__ is called before the parent's, so we need to get tp_size here too
+        if dist.is_initialized():
+            tp_size = dist.get_world_size()
+        else:
+            tp_size = 1
+            
         self.num_heads = divide(self.total_num_heads, tp_size)
         self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
         input_size = hidden_size
@@ -172,3 +184,5 @@ class RowParallelLinear(LinearBase):
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y
+
+

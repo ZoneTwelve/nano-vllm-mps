@@ -1,6 +1,8 @@
+# FILE: nanovllm/engine/block_manager.py
 from collections import deque
 import xxhash
 import numpy as np
+from typing import List, Dict, Deque, Set
 
 from nanovllm.engine.sequence import Sequence
 
@@ -13,7 +15,7 @@ class Block:
         self.hash = -1
         self.token_ids = []
 
-    def update(self, hash: int, token_ids: list[int]):
+    def update(self, hash: int, token_ids: List[int]):
         self.hash = hash
         self.token_ids = token_ids
 
@@ -28,13 +30,13 @@ class BlockManager:
     def __init__(self, num_blocks: int, block_size: int):
         assert num_blocks > 0
         self.block_size = block_size
-        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.used_block_ids: set[int] = set()
+        self.blocks: List[Block] = [Block(i) for i in range(num_blocks)]
+        self.hash_to_block_id: Dict[int, int] = dict()
+        self.free_block_ids: Deque[int] = deque(range(num_blocks))
+        self.used_block_ids: Set[int] = set()
 
     @classmethod
-    def compute_hash(cls, token_ids: list[int], prefix: int = -1):
+    def compute_hash(cls, token_ids: List[int], prefix: int = -1):
         h = xxhash.xxh64()
         if prefix != -1:
             h.update(prefix.to_bytes(8, "little"))

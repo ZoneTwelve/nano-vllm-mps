@@ -1,26 +1,46 @@
+# FILE: nanovllm/config.py
 import os
 from dataclasses import dataclass
 from transformers import AutoConfig
+import torch
+from typing import Optional
 
 
 @dataclass
 class Config:
     model: str
+    device: str = "auto"
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
-    hf_config: AutoConfig | None = None
+    hf_config: Optional[AutoConfig] = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 
     def __post_init__(self):
-        assert os.path.isdir(self.model)
+        # assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+
+        # MPS backend support: Auto-detect device
+        if self.device == "auto":
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif torch.backends.mps.is_available():
+                self.device = "mps"
+            else:
+                self.device = "cpu"
+        
+        # MPS backend support: Force single-process and eager mode
+        if self.device == "mps":
+            print("MPS backend detected. Forcing tensor_parallel_size=1 and enforce_eager=True.")
+            self.tensor_parallel_size = 1
+            self.enforce_eager = True  # CUDA graphs are not supported on MPS
+
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len

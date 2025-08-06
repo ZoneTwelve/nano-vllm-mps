@@ -1,8 +1,10 @@
+# FILE: nanovllm/engine/model_runner.py
 import pickle
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
+from typing import Union, List
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
@@ -14,7 +16,7 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Union[Event, List[Event]]):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -22,19 +24,28 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.device = config.device
+        self.is_cuda = self.device == "cuda"
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        if self.world_size > 1:
+            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        
+        if self.is_cuda:
+            torch.cuda.set_device(rank)
+        
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
-        torch.set_default_device("cuda")
+        torch.set_default_device(self.device)
+        
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
+        
+        if self.is_cuda and not self.enforce_eager:
             self.capture_cudagraph()
+        
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -53,10 +64,17 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
+        
+        if self.is_cuda and not self.enforce_eager:
             del self.graphs, self.graph_pool
-        torch.cuda.synchronize()
-        dist.destroy_process_group()
+        
+        if self.is_cuda:
+            torch.cuda.synchronize()
+        elif self.device == "mps":
+            torch.mps.synchronize()
+            
+        if self.world_size > 1:
+            dist.destroy_process_group()
 
     def loop(self):
         while True:
@@ -89,25 +107,60 @@ class ModelRunner:
         return method(*args)
 
     def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+        if self.is_cuda:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+        elif self.device == "mps":
+            torch.mps.empty_cache()
+
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        num_seqs = min(self.config.max_num_seqs, 4)
+        warmup_len = min(max_model_len, 1024)
+        seqs = [Sequence([0] * warmup_len) for _ in range(num_seqs)]
+        
         self.run(seqs, True)
-        torch.cuda.empty_cache()
+        
+        if self.is_cuda:
+            torch.cuda.empty_cache()
+        elif self.device == "mps":
+            torch.mps.empty_cache()
 
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        
+        if self.is_cuda:
+            free, total = torch.cuda.mem_get_info()
+            used = total - free
+            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+            current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+            available_mem = total * config.gpu_memory_utilization - used - peak + current
+        else: # MPS
+            # CORRECTED LOGIC FOR MPS:
+            # Use current_allocated_memory after model loading as a proxy for model footprint.
+            model_mem = torch.mps.current_allocated_memory()
+            pool_size = torch.mps.driver_allocated_memory()
+            available_mem = pool_size * config.gpu_memory_utilization - model_mem
+            print("model_mem", model_mem)
+            print("pool_size", pool_size)
+
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        
+        if available_mem > 0:
+            config.num_kvcache_blocks = int(available_mem) // block_bytes
+        else:
+            config.num_kvcache_blocks = 0
+
+        assert config.num_kvcache_blocks > 0, (
+            f"Insufficient GPU memory to allocate KV cache. "
+            f"Calculated available memory for cache: {available_mem / 1e9:.2f} GB. "
+            f"Estimated KV block size: {block_bytes / 1e6:.2f} MB. "
+            f"This resulted in {config.num_kvcache_blocks} blocks. "
+            "Try lowering the `gpu_memory_utilization` parameter (e.g., to 0.8) "
+            "or use a smaller model."
+        )
+
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -117,9 +170,9 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
+        max_len = max(len(seq.block_table) for seq in seqs) if seqs else 0
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=self.is_cuda).to(self.device, non_blocking=self.is_cuda)
         return block_tables
 
     def prepare_prefill(self, seqs: list[Sequence]):
@@ -150,14 +203,15 @@ class ModelRunner:
                 else:
                     end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=self.is_cuda).to(self.device, non_blocking=self.is_cuda)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=self.is_cuda).to(self.device, non_blocking=self.is_cuda)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=self.is_cuda).to(self.device, non_blocking=self.is_cuda)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=self.is_cuda).to(self.device, non_blocking=self.is_cuda)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=self.is_cuda).to(self.device, non_blocking=self.is_cuda)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables, block_size=self.block_size)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -170,24 +224,25 @@ class ModelRunner:
             positions.append(len(seq))
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=self.is_cuda).to(self.device, non_blocking=self.is_cuda)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=self.is_cuda).to(self.device, non_blocking=self.is_cuda)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=self.is_cuda).to(self.device, non_blocking=self.is_cuda)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=self.is_cuda).to(self.device, non_blocking=self.is_cuda)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables, block_size=self.block_size)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
         for seq in seqs:
             temperatures.append(seq.temperature)
-        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=self.is_cuda).to(self.device, non_blocking=self.is_cuda)
         return temperatures
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        if is_prefill or not self.is_cuda or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
@@ -231,10 +286,10 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs], block_size=self.block_size)
+            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
             with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph

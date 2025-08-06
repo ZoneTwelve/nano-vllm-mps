@@ -1,6 +1,8 @@
+# FILE: nanovllm/layers/rotary_embedding.py
 from functools import lru_cache
 import torch
 from torch import nn
+from typing import Optional, Dict
 
 
 def apply_rotary_emb(
@@ -61,7 +63,7 @@ def get_rope(
     rotary_dim: int,
     max_position: int,
     base: float,
-    rope_scaling: dict | None = None,
+    rope_scaling: Optional[Dict] = None,
 ):
     assert rope_scaling is None
     rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)

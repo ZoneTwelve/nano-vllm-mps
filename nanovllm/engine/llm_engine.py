@@ -1,6 +1,8 @@
+# FILE: nanovllm/engine/llm_engine.py
 import atexit
 from dataclasses import fields
 from time import perf_counter
+from typing import Union, List
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
@@ -18,28 +20,39 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         self.ps = []
         self.events = []
-        ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        
+        # MPS backend support: Conditional multiprocessing for tensor parallelism
+        if config.tensor_parallel_size > 1:
+            ctx = mp.get_context("spawn")
+            for i in range(1, config.tensor_parallel_size):
+                event = ctx.Event()
+                process = ctx.Process(target=ModelRunner, args=(config, i, event))
+                process.start()
+                self.ps.append(process)
+                self.events.append(event)
+            self.model_runner = ModelRunner(config, 0, self.events)
+        else:
+            self.model_runner = ModelRunner(config, 0, [])
+
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
     def exit(self):
-        self.model_runner.call("exit")
+        # MPS backend support: Conditional exit logic
+        if self.config.tensor_parallel_size > 1:
+            self.model_runner.call("exit")
+        else:
+            self.model_runner.exit() # Direct call for single process mode
         del self.model_runner
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: Union[str, List[int]], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
@@ -47,7 +60,9 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if not seqs:
+            return [], 0
+        token_ids = self.model_runner.call("run", seqs, is_prefill) if self.config.tensor_parallel_size > 1 else self.model_runner.run(seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
@@ -58,8 +73,8 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
-        sampling_params: SamplingParams | list[SamplingParams],
+        prompts: Union[List[str], List[List[int]]],
+        sampling_params: Union[SamplingParams, List[SamplingParams]],
         use_tqdm: bool = True,
     ) -> list[str]:
         if use_tqdm:
@@ -75,9 +90,9 @@ class LLMEngine:
             output, num_tokens = self.step()
             if use_tqdm:
                 if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                    prefill_throughput = num_tokens / (perf_counter() - t) if (perf_counter() - t) > 0 else 0
+                elif num_tokens < 0:
+                    decode_throughput = -num_tokens / (perf_counter() - t) if (perf_counter() - t) > 0 else 0
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",

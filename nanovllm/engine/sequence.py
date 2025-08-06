@@ -1,6 +1,8 @@
+# FILE: nanovllm/engine/sequence.py
 from copy import copy
 from enum import Enum, auto
 from itertools import count
+from typing import List
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -15,7 +17,7 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(self, token_ids: List[int], sampling_params = SamplingParams()):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)

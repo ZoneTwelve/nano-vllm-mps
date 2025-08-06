@@ -1,3 +1,4 @@
+# FILE: nanovllm/layers/embed_head.py
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -14,8 +15,13 @@ class VocabParallelEmbedding(nn.Module):
         embedding_dim: int,
     ):
         super().__init__()
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        if dist.is_initialized():
+            self.tp_rank = dist.get_rank()
+            self.tp_size = dist.get_world_size()
+        else:
+            self.tp_rank = 0
+            self.tp_size = 1
+            
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
